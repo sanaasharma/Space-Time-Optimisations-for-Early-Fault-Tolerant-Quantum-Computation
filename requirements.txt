@@ -1,0 +1,8 @@
+# Python 3.12
+qiskit==2.0.0
+# Clifford+T approximation of rotations that are not multiples of pi/4
+pygridsynth==2.0.0
+
+# tests only
+pytest
+pytest-timeout

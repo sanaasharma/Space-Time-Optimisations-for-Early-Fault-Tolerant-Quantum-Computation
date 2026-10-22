@@ -1,8 +1,8 @@
-from qiskit.circuit.library import PhaseGate, SXGate, UGate, CXGate, IGate, TGate, TdgGate, SGate, CCXGate, SXGate, SdgGate
-from qiskit.circuit import Instruction, Gate
-from qiskit import QuantumCircuit, transpile, QuantumRegister
-from Functions import find_index, find_shortest_path, find_path
-import random  
+from qiskit.circuit.library import TGate, SGate
+from qiskit.circuit import Gate
+from qiskit import QuantumCircuit, QuantumRegister
+from Functions import find_index, find_shortest_path, RoutingError, is_data, adjacent
+import random
  
  
   
@@ -47,21 +47,29 @@ def check_CT(qubit, control_coords, target_coords, grid, dag):
 
     # Move qubit to control if needed
     if (qi, qj) != (ci, cj):
-        
-        path = find_shortest_path((qi, qj), (ci, cj), grid, true_coords=target_coords)
+
+        path = find_shortest_path((qi, qj), (ci, cj), grid, true_coords=[target_coords])
         temp_dag, temp_grid = move_along_path_reversed(path, grid, dag)
         if temp_dag is not None:
             dag, grid = temp_dag, temp_grid
-    
-    if grid[ti][tj]=='m':
+        qi, qj = find_index(grid, qubit)
+
+    # the magic state can only be consumed by a qubit in a neighbouring cell
+    if grid[ti][tj]=='m' and adjacent((qi, qj), (ti, tj)):
         grid[ti][tj]=0
         return True, dag,grid
- 
+
+    if grid[ti][tj]=='m':
+        grid[ti][tj]=0  # unusable magic state: discard it so it does not block routing
+
     return False, dag, grid
 
-def check_CNOT(control_coords, target_coords, grid, dag):
+def check_CNOT(control_coords, target_coords, grid, dag, depth=0, max_depth=10):
     from Move_functions import move_ancilla
-    
+
+    if depth > max_depth:
+        return False
+
     ci, cj = control_coords
     ti, tj = target_coords
     ancilla_options = [(ti, cj)]
@@ -80,42 +88,14 @@ def check_CNOT(control_coords, target_coords, grid, dag):
     elif potential_cells:
         grid, dag = move_ancilla(control_coords, target_coords, grid, dag)
         if grid is not None:
-            return check_CNOT(control_coords, target_coords, grid, dag)
+            return check_CNOT(control_coords, target_coords, grid, dag, depth + 1, max_depth)
         else:
             return False
     else:
         return False
 
- 
 
-def check_CNOT_new(control_coords, target_coords, grid, dag):
-    from  Move_functions import move_extended
-    ci,cj = control_coords
-    ti,tj = target_coords
-    ancilla_options = [(ti, cj)]
-    potential_cells = []
-    valid_cells = []
-
-    for x, y in ancilla_options:
-        if abs(ci - ti) == 1 and abs(cj - tj) == 1 and 0 <= x < len(grid) and 0 <= y < len(grid[0]) and grid[x][y] != -1:
-            potential_cells.append((x, y))
-            if grid[x][y] == 0:
-                valid_cells.append((x, y))
-
-    if valid_cells:
-        return random.choice(valid_cells)
-    elif potential_cells:
-        true_coords = [control_coords, target_coords]
-        for cell in potential_cells:
-            dag, grid = move_extended([cell], grid, dag, true_coords)
-            if grid is not None:
-                return check_CNOT(control_coords, target_coords, grid, dag)
-        return False
-    else:
-        return False
-
-
-def check_S_new(coords, grid, dag, depth=0, max_depth=1000):
+def check_S_new(coords, grid, dag, depth=0, max_depth=20):
     from  Move_functions import move_extended
     i, j = coords
     ancilla_options = [(i + 1, j), (i - 1, j)]
@@ -149,7 +129,9 @@ def check_S_new(coords, grid, dag, depth=0, max_depth=1000):
 
 
 def apply_S(grid, coords, ancilla, dag, node, required_node_removal=None):
-    
+    if not (is_data(grid, coords) and adjacent(coords, ancilla) and grid[ancilla[0]][ancilla[1]] == 0):
+        raise RoutingError(f"illegal S: qubit cell {coords}, ancilla {ancilla}")
+
     q_indices = [coords, ancilla]
     nodes = [i * len(grid[0]) + j for (i, j) in q_indices]
     qargs = [dag.qubits[nodes[0]], dag.qubits[nodes[1]]]
@@ -161,7 +143,10 @@ def apply_S(grid, coords, ancilla, dag, node, required_node_removal=None):
     return dag
    
 def apply_H(ancilla,qindex,grid,dag,node, remove_rotation=None):
-    
+    q, a = divmod(qindex, len(grid[0])), ancilla[0]
+    if not (is_data(grid, q) and adjacent(q, a) and grid[a[0]][a[1]] == 0):
+        raise RoutingError(f"illegal H: qubit cell {q}, ancilla {a}")
+
     ancilla_indices = [i * len(grid[0]) + j for (i, j) in ancilla] 
     qargs = [dag.qubits[qindex],dag.qubits[ancilla_indices[0]]]
     custom_h=CustomHGate()
@@ -171,26 +156,30 @@ def apply_H(ancilla,qindex,grid,dag,node, remove_rotation=None):
     
     return dag
 
-def apply_X(qindex,dag,node):
+def apply_X(qindex,dag,node,remove=True):
  
     qargs = [dag.qubits[qindex]]
     custom_x=CustomXGate()
     dag.apply_operation_back(custom_x,qargs=qargs)
-    dag.remove_op_node(node)
+    if remove:
+        dag.remove_op_node(node)
 
     return dag
 
-def apply_Z(qindex,dag,node):
+def apply_Z(qindex,dag,node,remove=True):
  
     qargs = [dag.qubits[qindex]]
     custom_z=CustomZGate()
     dag.apply_operation_back(custom_z,qargs=qargs)
-    dag.remove_op_node(node)
+    if remove:
+        dag.remove_op_node(node)
 
     return dag
   
  
 def apply_CT(node1, node2,grid,dag ):
+    if not (is_data(grid, node1) and adjacent(node1, node2)):
+        raise RoutingError(f"illegal T: qubit cell {node1}, magic state {node2}")
 
     qindices=[node1]+[node2]
     nodes=[i * len(grid[0]) + j  for (i,j) in qindices]
@@ -203,6 +192,10 @@ def apply_CT(node1, node2,grid,dag ):
        
  
 def apply_CNOT(ancilla,node_qargs,grid,dag,node):
+    (ci, cj), (ti, tj) = (divmod(q, len(grid[0])) for q in node_qargs)
+    if not (is_data(grid, (ci, cj)) and is_data(grid, (ti, tj)) and abs(ci - ti) == 1 and abs(cj - tj) == 1
+            and tuple(ancilla) == (ti, cj) and grid[ti][cj] == 0):
+        raise RoutingError(f"illegal CNOT: control {(ci, cj)}, target {(ti, tj)}, ancilla {ancilla}")
 
     i,j=ancilla
     ancilla_indices =  i * len(grid[0]) + j  

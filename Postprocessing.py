@@ -1,4 +1,4 @@
-from qiskit.converters import circuit_to_dag, dag_to_circuit
+from qiskit.converters import circuit_to_dag
 from qiskit.dagcircuit import DAGOpNode
 from qiskit.circuit import Instruction, Gate
 from qiskit import QuantumCircuit
@@ -111,11 +111,16 @@ def move_commuting_nodes(non_commuting_nodes, dag_nodes):
     return layers
  
 def get_time_between_magicmoves(layers ):
-     
+    """Returns (segments, final_segment).
 
-     
+    segments has exactly one entry (layer index, time) per magic state consumed ('ct' gate):
+    the time spent since the previous magic state was consumed. final_segment is the
+    (layer index, time) of the work after the last magic state; it consumes no magic state,
+    so the number of magic states is len(segments), not len(segments) + 1."""
+
     cumulative_time = 0
     results = []
+    i = -1
 
     for i, layer in enumerate(layers):
         
@@ -131,7 +136,7 @@ def get_time_between_magicmoves(layers ):
                     ct_index = next((i for i, node in enumerate(layer) if node.op.name == 'magicmove'), None)
                     midx=layer[ct_index].qargs[-1]._index 
                     if cidx==midx:
-                        temp = max(get_move_time_total(node) for node in layer if node.op.name not in {"magicmove" or node.op.name!= "ct" } )
+                        temp = max((get_move_time_total(node) for node in layer if node.op.name not in {"magicmove", "ct"}), default=0)
                          
                         if  temp ==0:
                              
@@ -164,10 +169,8 @@ def get_time_between_magicmoves(layers ):
                 if layer:
                     layer_time = max(get_move_time_total(node) for node in layer)
                     cumulative_time += layer_time
-                 
-    results.append((i, cumulative_time))
 
-    return results
+    return results, (i, cumulative_time)
 
 def remove_repetitions(data):
     seen = set()   
@@ -227,7 +230,6 @@ def move_magicmoves_through_commuting_ops(flat_nodes):
                     while j < len(dag_nodes):
                         next_node = dag_nodes[j]
                         if next_node.op.name=="magicmove":
-                            #if dag_nodes[j+1]=='ct':
                             break
                         elif next_node.op.name == 'barrier':
                             j += 1
@@ -325,47 +327,21 @@ def get_move_time_total(node):
     }
       
     if node.op.__class__.__name__ == 'CustomDelayGate':
-        print(node.op)
         return node.op.delay_time
 
     
         
     return gate_durations.get(node.op.name,1 )
 
-def update_grid_from_dag_moves(layer, grid):
-   
-     
-    rows, cols = len(grid), len(grid[0])
+def generate_time(dag, processing_time=(11,)):
+    """Estimate the execution time of a compiled DAG (Measure and Barrier nodes removed).
 
-    
-
-    for node in layer:
-        if node.op.name == "move":
-            qarg_indices = [q._index for q in node.qargs]
-             
-
-            source, target = qarg_indices[0], qarg_indices[-1]
-            
-
-            source_i, source_j = divmod(source,cols)
-            target_i, target_j = divmod(target,cols)
-           
-            if grid[target_i][target_j]==0:
-                grid[target_i][target_j]=grid[source_i][source_j]
-                grid[source_i][source_j]=0
-
-    return grid
-
-def build_gridprocess(layers, initial_grid):
-    grid= copy.deepcopy(initial_grid)
-    grid_process=[copy.deepcopy(grid)]
-    for layer in layers:
-        grid= update_grid_from_dag_moves(layer, initial_grid, grid)
-        grid_process.append(copy.deepcopy(grid))
-    
-    return grid_process
-
-def generate_time(dag):
+    For every factory processing time t_MSF in `processing_time`, the time between two
+    consecutive magic state consumptions is at least t_MSF (the consumer waits for the
+    factory). Returns (overheads, totals, new_dag, n_magic_states) with one entry per t_MSF:
+      totals[k]    = sum over segments of max(segment, t_MSF) + final segment
+      overheads[k] = sum over segments and the final segment of max(0, segment - t_MSF)
+    n_magic_states is the number of 'ct' gates, so the factory lower bound is n_magic_states * t_MSF."""
 
     op_layers = []
     for layer in dag.multigraph_layers():
@@ -403,21 +379,17 @@ def generate_time(dag):
         new_circuit.barrier(*qubits_in_layer )
             
     new_dag= circuit_to_dag(new_circuit)
-    result=get_time_between_magicmoves(final_dag )
-    processing_time=[11] #for different distillation factories and their processing times
+    segments, (_, final_time) = get_time_between_magicmoves(final_dag )
+    n_magic_states = sum(1 for layer in final_dag for node in layer if node.op.name == 'ct')
+    assert n_magic_states == len(segments)
     overheads=[]
     totals=[]
     for pro_time in processing_time:
-        overhead=sum(time- pro_time if time> pro_time else 0 for _,time in result)
-        _,y=result[-1]
-        total= sum(time if time> pro_time else pro_time for _,time in result[:-1]) + y
+        overhead=sum(max(time - pro_time, 0) for _,time in segments) + max(final_time - pro_time, 0)
+        total= sum(max(time, pro_time) for _,time in segments) + final_time
         overheads.append(overhead) #more than processing time used for distillation
         totals.append(total)
-         
-    return overheads, totals, new_dag
-        #total_time+=time
-        
-    
- 
- 
+
+    return overheads, totals, new_dag, n_magic_states
+
         

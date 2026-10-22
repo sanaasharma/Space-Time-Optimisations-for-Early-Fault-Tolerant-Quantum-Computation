@@ -1,64 +1,111 @@
-from Functions import find_index, find_best_path, find_path, space_search 
-from Gates import CustomTGate, CustomHGate, CustomSGate , check_S, check_H, apply_Z, apply_H, check_S_new, check_CT, apply_CT, apply_S
-from Move_functions import move_ancilla,build_ancilla, move_extended, perform_move , MagicMoveGate ,MoveGate,move_along_path_reversed
-from qiskit.synthesis import generate_basic_approximations
-from qiskit.transpiler.passes.synthesis import SolovayKitaev
-from qiskit.converters import circuit_to_dag, dag_to_circuit
-from qiskit.circuit.library import PhaseGate, SXGate, UGate, CXGate, IGate, TGate, TdgGate, SGate, CCXGate, SXGate, SdgGate, HGate
-from qiskit import QuantumCircuit, transpile
-import random
-
-import numpy as np
+from Functions import find_index, find_best_path, find_path, space_search, LayoutInfeasible, adjacent, factory_position
+from Gates import check_H, apply_Z, apply_X, apply_H, check_S_new, check_CT, apply_CT, apply_S
+from Move_functions import build_ancilla, move_extended, MagicMoveGate, free_a_neighbour, move_to_free_cell
+from qiskit.converters import circuit_to_dag
+from qiskit import QuantumCircuit
+from functools import lru_cache
+import math
 
 
+MAX_ROTATION_ATTEMPTS = 5
 
- 
+# Accuracy of the Clifford+T approximation of rotations that are not multiples of pi/4
+# (operator-norm error, up to global phase). Set with set_rotation_epsilon().
+ROTATION_EPSILON = 1e-4
+
+# rz(k*pi/4) up to global phase, k = 0..7: exact, no approximation needed
+_EXACT_RZ = {0: [], 1: ["t"], 2: ["s"], 3: ["s", "t"], 4: ["z"], 5: ["z", "t"], 6: ["sdg"], 7: ["tdg"]}
+_GRIDSYNTH_GATES = {"H": "h", "S": "s", "T": "t", "X": "x"}  # gridsynth also emits W/I (global phase)
 
 
-def magic_state_routing_first_pass(grid,qubit,dag, number,path_log, S_presence=bool):
-     
-  
-    
-    if number==0:
-        start_i , start_j=int(len(grid)/2) , 0
-    "For more magic state factories, add the factory placement as given below:"
-    "if number==1:"
-    "  start_i , start_j=int(len(grid)/2)-1 , int(len(grid[0])) "
-    "add factories around the edges."
- 
-    start=start_i , start_j
-     
+def set_rotation_epsilon(epsilon):
+    global ROTATION_EPSILON
+    ROTATION_EPSILON = float(epsilon)
 
-    target_i, target_j= find_index(grid,qubit)
-     
-    path,f_i, f_j = find_best_path(grid,start_i,start_j,target_i,target_j,S_presence)
-    end=f_i,f_j
-    
-    temp_grid,temp_dag= process_nonzero_cells(grid,path,end,dag)
-    
-    
-    if temp_grid is not None:
-        
-        grid,dag =temp_grid,temp_dag
-        grid[start_i][start_j]='m'
-        custom_magicmove= MagicMoveGate(path, start,end,len(path),operation_time=0)
-        dag, _, _, grid = custom_magicmove.update_dag_and_grid( grid,dag,path, start, end) 
-        return grid, dag , (f_i,f_j),path_log
-    
-    else: 
-        path,_ = find_path(grid,start,end)
+
+@lru_cache(maxsize=None)
+def decompose_rz(angle, epsilon):
+    """Clifford+T gate names (circuit order) for rz(angle). Multiples of pi/4 are exact; any other
+    angle is approximated to `epsilon` with gridsynth (Ross & Selinger), which uses about
+    3*log2(1/epsilon) T gates."""
+    k = angle / (math.pi / 4)
+    if abs(k - round(k)) < 1e-9:
+        return tuple(_EXACT_RZ[round(k) % 8])
+    try:
+        from pygridsynth.gridsynth import gridsynth_gates
+    except ImportError as e:
+        raise ImportError("rotations that are not multiples of pi/4 need pygridsynth "
+                          "(pip install -r requirements.txt)") from e
+    word = gridsynth_gates(theta=repr(float(angle)), epsilon=repr(float(epsilon)), seed=0, up_to_phase=True)
+    # the word is an operator product (rightmost gate acts first), so reverse it for circuit order
+    return tuple(_GRIDSYNTH_GATES[g] for g in reversed(word) if g in _GRIDSYNTH_GATES)
+
+
+def rotation_circuit_for(node_input, sx=False):
+    if sx:
+        names = ("sdg", "h", "sdg")  # sx up to global phase
+    else:
+        names = decompose_rz(float(node_input.op.params[0]), ROTATION_EPSILON)
+    circuit = QuantumCircuit(1)
+    for name in names:
+        getattr(circuit, name)(0)
+    return circuit_to_dag(circuit)
+
+
+def _clear_magic_path(grid, dag, start, target, S_presence, path_log):
+    """Plan a magic state path from the factory cell `start` to a usable neighbour of `target`
+    and clear it. Re-plans around cells that cannot be cleared. Returns (dag, grid, path, end);
+    path is None if no clear path was found."""
+    forbidden = [target]  # the path must not run through the qubit that will consume the state
+    for _attempt in range(4):
+        try:
+            path,f_i, f_j = find_best_path(grid,start[0],start[1],target[0],target[1],S_presence, forbidden=forbidden)
+        except LayoutInfeasible:
+            return dag, grid, None, None
+        end=f_i,f_j
+        found = find_path(grid,start,end,forbidden)
+        if found is None:
+            return dag, grid, None, None
+        path,_ = found
         path_log.append(path)
-        temp_dag,temp_grid= move_extended(path, grid,dag,path)
-        if temp_grid is not None:
-            
-            grid,dag =temp_grid,temp_dag
-            grid[start_i][start_j]='m'
-            custom_magicmove= MagicMoveGate(path, start,end,len(path),operation_time=0)
-            dag, _, _, grid = custom_magicmove.update_dag_and_grid( grid,dag,path, start, end)
-            path_log.append(grid)
-            return grid, dag , (f_i,f_j),path_log
-        
-    return None,None,None, path_log
+        # clear the path (not the factory cell itself, which may already hold a waiting magic state);
+        # the cleared qubits must not be pushed through the consuming qubit either
+        dag,grid= move_extended(path[1:] if grid[start[0]][start[1]] == 'm' else path, grid,dag,path + [target])
+        blocked = [c for c in path[1:] if grid[c[0]][c[1]] != 0]
+        if not blocked:
+            return dag, grid, path, end
+        forbidden = forbidden + blocked  # re-plan around the cells that could not be cleared
+    return dag, grid, None, None
+
+
+def _relocate_qubit(grid, dag, target):
+    """Last resort: move the qubit at `target` through free cells to the nearest free cell that has
+    a free cell above or below it, where a magic state can be delivered. Returns True if moved."""
+    rows = len(grid)
+    def has_free_vertical_neighbour(c):
+        return any(0 <= r < rows and grid[r][c[1]] == 0 for r in (c[0] - 1, c[0] + 1))
+    return move_to_free_cell(grid, dag, target, has_free_vertical_neighbour)
+
+
+def magic_state_routing_first_pass(grid,qubit,dag, number,path_log, S_presence=True):
+
+    start = factory_position(grid, number)
+    target = find_index(grid,qubit)
+
+    dag, grid, path, end = _clear_magic_path(grid, dag, start, target, S_presence, path_log)
+    if path is None and _relocate_qubit(grid, dag, target):
+        target = find_index(grid,qubit)
+        dag, grid, path, end = _clear_magic_path(grid, dag, start, target, S_presence, path_log)
+    if path is None:
+        raise LayoutInfeasible(f"no clear path for a magic state from factory {start} to qubit {qubit} at {target}")
+    if grid[start[0]][start[1]] not in (0, 'm'):
+        return None,None,None, path_log  # the factory output cell is still occupied
+
+    grid[start[0]][start[1]]='m'  # a new magic state, or the one still waiting from a failed delivery
+    custom_magicmove= MagicMoveGate(path, start,end,len(path),operation_time=0)
+    dag, _, _, grid = custom_magicmove.update_dag_and_grid( grid,dag,path, start, end)
+    path_log.append(grid)
+    return grid, dag , end,path_log
  
 def convert_index(grid,initial_grid,node):
         node_qargs = [q._index for q in node.qargs]
@@ -70,25 +117,16 @@ def convert_index(grid,initial_grid,node):
  
 
 def rotation_consumption(qubit,dag,initial_grid,grid,node_input,number,path_log, SXGATE=None, executed_nodes=None):
+    """Execute rz / sx gate `node_input` as a sequence of Clifford+T operations.
+    `qubit` is ignored; the qubit is always taken from node_input."""
 
-    
+    i, j = divmod(node_input.qargs[0]._index, len(grid[0]))
+    qubit = initial_grid[i][j]
 
     if executed_nodes is None:
         executed_nodes = set()
 
-    if SXGATE==None:
-        angle=node_input.op.params[0]
-        circuit = QuantumCircuit(1)
-        circuit.rz(angle, 0)
-    else:
-        circuit = QuantumCircuit(1)
-        circuit.sx(0)
-    
-    basis = ["s", "sdg", "t", "tdg", "z", "h"]
-    approx = generate_basic_approximations(basis, depth=3) 
-    skd = SolovayKitaev(recursion_degree=2, basic_approximations= approx)
-    discretized = skd(circuit)
-    rotation_circuit=circuit_to_dag(discretized)
+    rotation_circuit = rotation_circuit_for(node_input, sx=SXGATE is not None)
     success=False
      
 
@@ -102,7 +140,7 @@ def rotation_consumption(qubit,dag,initial_grid,grid,node_input,number,path_log,
 
             try:
 
-                if node.op.name =='t': 
+                if node.op.name in ('t', 'tdg'): 
 
                     
                     qindex,ci,cj=convert_index(grid,initial_grid,node_input)
@@ -125,10 +163,10 @@ def rotation_consumption(qubit,dag,initial_grid,grid,node_input,number,path_log,
                         return None,None,executed_nodes,path_log 
                     
                  
-                if node.op.name=='z':
+                if node.op.name in ('z', 'x'):  # Pauli frame update, no routing needed
                      
                     qindex,_,_=convert_index(grid,initial_grid,node_input)
-                    dag=apply_Z(qindex,dag,node)
+                    dag=(apply_Z if node.op.name == 'z' else apply_X)(qindex,dag,node,remove=False)
                     executed_nodes.add(node)
                   
 
@@ -145,6 +183,8 @@ def rotation_consumption(qubit,dag,initial_grid,grid,node_input,number,path_log,
                         dof= space_search((true_i,true_j), grid, "h")
                         dag,grid= build_ancilla(dof,grid,(true_i,true_j),node.op.name,dag)
                         qindex,true_i,true_j=convert_index(grid,initial_grid,node_input)
+                        if not check_H((true_i,true_j),grid):
+                            dag,grid= free_a_neighbour((true_i,true_j), grid, dag)
                         if check_H((true_i,true_j),grid):
                             ancilla=check_H((true_i,true_j),grid)
                             dag=apply_H(ancilla, qindex,grid, dag, node,node_input)
@@ -156,18 +196,19 @@ def rotation_consumption(qubit,dag,initial_grid,grid,node_input,number,path_log,
                 if node.op.name in ('s', 'sdg'):
 
                     qindex,true_i,true_j=convert_index(grid,initial_grid,node_input)
-                    if check_S_new((true_i,true_j), grid,dag):
-                        ancilla= check_S_new((true_i,true_j), grid,dag)
+                    ancilla= check_S_new((true_i,true_j), grid,dag)
+                    qindex,true_i,true_j=convert_index(grid,initial_grid,node_input)  # check_S_new can move qubits
+                    if ancilla and adjacent((true_i,true_j), ancilla) and grid[ancilla[0]][ancilla[1]] == 0:
                         dag= apply_S(grid, (true_i,true_j),ancilla, dag, node,node_input)
                         executed_nodes.add(node)
                     else: 
                         dof= space_search((true_i,true_j), grid, "s")
                         dag,grid= build_ancilla(dof,grid,(true_i,true_j),node.op.name,dag)
+                        qindex,true_i,true_j=convert_index(grid,initial_grid,node_input)  # build_ancilla can move the qubit
                         ancilla= check_S_new((true_i,true_j), grid,dag)
-                        if check_S_new((true_i,true_j), grid,dag):
-                            
-                            ancilla= check_S_new((true_i,true_j), grid,dag)
-                            dag= apply_S(grid, (true_i,true_j), random.choice(ancilla), dag, node,node_input)
+                        qindex,true_i,true_j=convert_index(grid,initial_grid,node_input)
+                        if ancilla and adjacent((true_i,true_j), ancilla) and grid[ancilla[0]][ancilla[1]] == 0:
+                            dag= apply_S(grid, (true_i,true_j), ancilla, dag, node,node_input)
                             executed_nodes.add(node)
 
                         else:
@@ -175,77 +216,25 @@ def rotation_consumption(qubit,dag,initial_grid,grid,node_input,number,path_log,
 
  
                  
-            except Exception as e:
+            except LayoutInfeasible:
                 return  None,None ,executed_nodes,path_log
-            
+
         return dag,grid,executed_nodes,path_log
-    
-    
-    while not success:
+
+
+    for _attempt in range(MAX_ROTATION_ATTEMPTS):
         new_dag,_,executed_nodes,path_log= rotation_check(rotation_circuit,dag,grid,executed_nodes,qubit,initial_grid,node_input,path_log)
-        if new_dag is None:
-            continue
-        else:  
-            if len(executed_nodes) == len(list(rotation_circuit.op_nodes())):
-                dag.remove_op_node(node_input)
-                success = True
+        if new_dag is not None and len(executed_nodes) == len(list(rotation_circuit.op_nodes())):
+            dag.remove_op_node(node_input)
+            success = True
+            break
 
+    if not success:
+        if not executed_nodes:
+            return None, None, path_log  # nothing applied yet: the caller can retry this rotation later
+        # part of the decomposed rotation is already in the DAG, so it cannot be retried later
+        raise LayoutInfeasible(
+            f"could not route rotation on qubit {qubit} after {MAX_ROTATION_ATTEMPTS} attempts; "
+            "the grid has too little free space")
 
-    return dag,grid,path_log 
- 
-  
-def process_nonzero_cells(grid, path, end,dag ):
-
-    def is_valid(i, j, grid):
-        return 0 <= i < len(grid) and 0 <= j < len(grid[0]) and grid[i][j] == 0
-
-    def get_neighbors(i, j):
-        directions = [(0,1), (1,0), (0,-1), (-1,0)]
-        return [(i+di, j+dj) for di, dj in directions]
-
-    def move_cell(grid, cell, path_set,dag):
-        i, j = cell
-        Found= False
-        for ni, nj in get_neighbors(i, j): 
-            if (ni, nj) not in path_set  and is_valid(ni, nj, grid):
-                Found=True
-                return (ni, nj),grid,dag
-        
-        if Found==False:
-
-            for ni, nj in get_neighbors(i, j):
-                    if (ni,nj) not in path_set  and 0 <= ni < len(grid) and 0 <= nj < len(grid[0]):
-                        if grid[ni][nj]!=-1: 
-                            for nni,nnj in get_neighbors(ni,nj):
-                                if (nni, nnj) not in path_set  and is_valid(nni, nnj, grid) and (nni,nnj) != (i,j):
-                                    dag, grid, _, _= perform_move(nni, nnj,ni, nj , dag, grid)
-                                    return (ni, nj),grid,dag
-                    elif (ni,nj) in path_set  and is_valid(ni,nj,grid):
-                            for nni,nnj in get_neighbors(ni,nj):
-                                if (nni, nnj) not in path_set  and is_valid(nni, nnj, grid) and (nni,nnj) != (i,j):
-                                   return (nni, nnj),grid,dag
-
-                        
-
-
-        return None, None,None   
-
-    path_set = set(path)
-    if all(grid[x][y]!=-1 for (x,y) in path):
-        return None, None
-    
-    for (i, j) in path:
-        if grid[i][j] != 0:
-            end,grid,dag = move_cell(grid, (i, j), path_set,dag)
-            if end is not None:
-                ti,tj=end[0],end[1]
-                dag, grid, _, _= perform_move(ti, tj, i,  j , dag, grid)
-                    
-        else:
-            return None, None
-
-             
-    return grid,dag 
-
-
- 
+    return dag,grid,path_log
